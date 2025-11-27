@@ -1,96 +1,86 @@
 pipeline {
-  agent any
+    agent any
 
-  environment {
-    IMAGE_TAG = "routepulse-svc:4"
-    CONTAINER_NAME = "routepulse-svc"
-    HOST_PORT = "12144"
-    CONTAINER_PORT = "12144"
-  }
+    stages {
 
-  options {
-    buildDiscarder(logRotator(numToKeepStr: '10'))
-    timestamps()
-  }
-
-  stages {
-    stage('Checkout') {
-      steps {
-        echo "Checking out repository..."
-        checkout scm
-      }
-    }
-
-    stage('Pre-check Docker') {
-      steps {
-        script {
-          echo "Verifying Docker CLI and daemon availability..."
-          def hasDocker = sh(script: 'which docker >/dev/null 2>&1 && echo "yes" || echo "no"', returnStdout: true).trim()
-          if (hasDocker != 'yes') {
-            error "Docker CLI not found on agent. Install Docker and ensure 'docker' is in PATH."
-          }
-          def dockerInfo = sh(script: 'docker info >/dev/null 2>&1 && echo "ok" || echo "nok"', returnStdout: true).trim()
-          if (dockerInfo != 'ok') {
-            error "Docker daemon is not reachable. Ensure Docker is running and the Jenkins agent can communicate with it."
-          }
-          echo "Docker is available and daemon is reachable."
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
         }
-      }
+
+        stage('Prepare / Build') {
+            steps {
+                echo "Checking Python and creating virtual environment..."
+                sh '''
+                    # Ensure python3 exists
+                    command -v python3 || { echo "python3 not found"; exit 1; }
+
+                    # Create venv
+                    python3 -m venv venv
+
+                    # Activate venv
+                    . venv/bin/activate
+
+                    # Upgrade pip
+                    pip install --upgrade pip
+
+                    # Install dependencies
+                    pip install -r requirements.txt
+                '''
+            }
+        }
+
+        stage('Test') {
+            steps {
+                echo "Running Unit Tests (before deploy)..."
+                sh '''
+                    . venv/bin/activate
+                    python -m unittest discover -s .
+                '''
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                echo "Deploying application..."
+                sh '''
+                    mkdir -p python-app-deploy
+                    cp app.py python-app-deploy/
+                '''
+            }
+        }
+
+        stage('Run Application') {
+            steps {
+                echo "Running the Flask application..."
+                sh '''
+                    . venv/bin/activate
+                    nohup python python-app-deploy/app.py > python-app-deploy/app.log 2>&1 &
+                    echo $! > python-app-deploy/app.pid
+                '''
+            }
+        }
+
+        stage('Test Application') {
+            steps {
+                echo "Testing Application After Deploy..."
+                sh '''
+                    . venv/bin/activate
+                    sleep 2
+                    python -m unittest discover -s .
+                '''
+            }
+        }
+
     }
 
-    stage('Build Docker Image') {
-      steps {
-        echo "Building Docker image ${IMAGE_TAG} ..."
-        sh "docker build -t ${IMAGE_TAG} ."
-      }
+    post {
+        success {
+            echo "Pipeline completed successfully!"
+        }
+        failure {
+            echo "Pipeline FAILED — Check logs!"
+        }
     }
-
-    stage('Stop existing container') {
-      steps {
-        echo "Stopping and removing any running container named ${CONTAINER_NAME} ..."
-        sh """
-          if [ \$(docker ps -a -q -f name=^/${CONTAINER_NAME}$ | wc -l) -gt 0 ]; then
-            docker rm -f ${CONTAINER_NAME} || true
-          fi
-        """
-      }
-    }
-
-    stage('Run container') {
-      steps {
-        echo "Starting container ${CONTAINER_NAME} on host port ${HOST_PORT} ..."
-        sh "docker run -d --name ${CONTAINER_NAME} -p ${HOST_PORT}:${CONTAINER_PORT} ${IMAGE_TAG}"
-      }
-    }
-
-    stage('Verify service') {
-      steps {
-        echo "Verifying container is running and responding..."
-        sh 'docker ps --filter "name=^/${CONTAINER_NAME}$" --format "table {{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}"'
-        sh """
-          sleep 3
-          if command -v curl >/dev/null 2>&1; then
-            curl -sS -I http://localhost:${HOST_PORT} | head -n 10
-          else
-            echo "curl not installed on agent; skipping HTTP verification."
-          fi
-        """
-      }
-    }
-  }
-
-  post {
-    success {
-      echo "Pipeline succeeded: image ${IMAGE_TAG} built and container ${CONTAINER_NAME} running on port ${HOST_PORT}."
-    }
-    failure {
-      echo "Pipeline failed. Inspect logs above."
-    }
-    always {
-      sh """
-        echo '--- container logs (last 50 lines) ---'
-        docker logs --tail 50 ${CONTAINER_NAME} || true
-      """
-    }
-  }
 }
